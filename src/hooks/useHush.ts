@@ -69,6 +69,8 @@ export function useHush() {
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
+  const retryCountRef = useRef<number>(0);
+  const isUnmountedRef = useRef<boolean>(false);
 
   // Play chimes via Web Audio / HTML5 Audio
   const playLocalSound = useCallback((which: "start" | "stop") => {
@@ -86,148 +88,183 @@ export function useHush() {
   }, []);
 
   const connect = useCallback(() => {
+    if (isUnmountedRef.current) return;
     if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) {
       return;
     }
 
-    const ws = new WebSocket(WS_URL);
-    wsRef.current = ws;
+    if (reconnectTimeoutRef.current) {
+      window.clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
 
-    ws.onopen = () => {
-      setConnected(true);
-      send({ action: "get_initial_state" });
-    };
+    try {
+      const ws = new WebSocket(WS_URL);
+      wsRef.current = ws;
 
-    ws.onclose = () => {
-      setConnected(false);
-      setRecording(false);
-      setBusy(false);
-      setState("idle");
-      // Reconnect after 1.5 seconds
-      reconnectTimeoutRef.current = window.setTimeout(connect, 1500);
-    };
-
-    ws.onerror = () => {
-      ws.close();
-    };
-
-    ws.onmessage = (evt) => {
-      try {
-        const msg = JSON.parse(evt.data);
-
-        // Handle initial data response
-        if (msg.action === "get_initial_state" && msg.data) {
-          const d: InitialStateData = msg.data;
-          setState(d.state || "idle");
-          setStateMessage(d.state_message || "");
-          setRecording(d.recording || false);
-          setBusy(d.busy || false);
-          setEnabled(d.enabled ?? true);
-          setEngineState(d.engine_state || "ready");
-          if (d.config) setConfig(d.config);
-          if (d.models) setModels(d.models);
-          if (d.hold_chords) setHoldChords(d.hold_chords);
-          if (d.toggle_combos) setToggleCombos(d.toggle_combos);
-          if (d.devices) setDevices(d.devices);
-          if (d.history) setHistory(d.history);
-          if (d.stats) setStats(d.stats);
+      ws.onopen = () => {
+        if (isUnmountedRef.current) {
+          ws.close();
           return;
         }
+        retryCountRef.current = 0;
+        setConnected(true);
+        send({ action: "get_initial_state" });
+      };
 
-        // Handle broadcast events
-        switch (msg.type) {
-          case "state_change":
-            setState(msg.state);
-            setStateMessage(msg.message || "");
-            setRecording(msg.recording ?? false);
-            setBusy(msg.busy ?? false);
-            if (msg.hands_free !== undefined) {
-              setIsHandsFreeSession(Boolean(msg.hands_free));
-            }
-            if (msg.state === "listening") {
-              setStreamingText("");
-            }
-            break;
+      ws.onclose = () => {
+        setConnected(false);
+        setRecording(false);
+        setBusy(false);
+        setState("idle");
 
-          case "engine_state":
-            setEngineState(msg.state);
-            break;
+        if (isUnmountedRef.current) return;
 
-          case "mic_level":
-            setMicLevel(msg.level);
-            break;
+        // Exponential backoff: 1s, 1.5s, 2.25s up to 10s max with randomized jitter
+        const count = retryCountRef.current;
+        retryCountRef.current = Math.min(count + 1, 10);
+        const delay = Math.min(10000, Math.round(1000 * Math.pow(1.5, count))) + Math.floor(Math.random() * 500);
 
-          case "meter_level":
-            setMeterLevel(msg.level);
-            break;
-
-          case "stream_chunk":
-            setStreamingText(msg.full_text || "");
-            break;
-
-          case "transcription_finished":
-            setLastTranscription({
-              text: msg.text,
-              duration: msg.duration,
-              success: msg.success,
-            });
-            if (msg.stats) setStats(msg.stats);
-            if (msg.text) {
-              setHistory((prev) => [
-                { ts: Date.now() / 1000, text: msg.text, seconds: msg.duration },
-                ...prev,
-              ]);
-            }
-            break;
-
-          case "download_progress":
-            setDownloadProgress({
-              model: msg.model,
-              downloaded_bytes: msg.downloaded_bytes,
-              total_bytes: msg.total_bytes,
-              percent: msg.percent,
-              is_alive: msg.is_alive,
-              error: msg.error,
-              done: msg.done,
-            });
-            if (msg.done) {
-              setModels((prev) => ({
-                ...prev,
-                [msg.model]: {
-                  ...(prev[msg.model] || {}),
-                  downloaded: !msg.error,
-                },
-              }));
-            }
-            break;
-
-          case "config_updated":
-            setConfig((prev) => ({ ...prev, [msg.key]: msg.value }));
-            break;
-
-          case "config_all_updated":
-            if (msg.config) setConfig(msg.config);
-            break;
-
-          case "history_cleared":
-            setHistory([]);
-            break;
-
-          case "enabled_state":
-            setEnabled(msg.enabled);
-            break;
+        if (reconnectTimeoutRef.current) {
+          window.clearTimeout(reconnectTimeoutRef.current);
         }
-      } catch (e) {
-        console.error("Error parsing WebSocket message", e);
-      }
-    };
+        reconnectTimeoutRef.current = window.setTimeout(connect, delay);
+      };
+
+      ws.onerror = () => {
+        try {
+          ws.close();
+        } catch {}
+      };
+
+      ws.onmessage = (evt) => {
+        try {
+          const msg = JSON.parse(evt.data);
+
+          // Handle initial data response
+          if (msg.action === "get_initial_state" && msg.data) {
+            const d: InitialStateData = msg.data;
+            setState(d.state || "idle");
+            setStateMessage(d.state_message || "");
+            setRecording(d.recording || false);
+            setBusy(d.busy || false);
+            setEnabled(d.enabled ?? true);
+            setEngineState(d.engine_state || "ready");
+            if (d.config) setConfig(d.config);
+            if (d.models) setModels(d.models);
+            if (d.hold_chords) setHoldChords(d.hold_chords);
+            if (d.toggle_combos) setToggleCombos(d.toggle_combos);
+            if (d.devices) setDevices(d.devices);
+            if (d.history) setHistory(d.history);
+            if (d.stats) setStats(d.stats);
+            return;
+          }
+
+          // Handle broadcast events
+          switch (msg.type) {
+            case "state_change":
+              setState(msg.state);
+              setStateMessage(msg.message || "");
+              setRecording(msg.recording ?? false);
+              setBusy(msg.busy ?? false);
+              if (msg.hands_free !== undefined) {
+                setIsHandsFreeSession(Boolean(msg.hands_free));
+              }
+              if (msg.state === "listening") {
+                setStreamingText("");
+              }
+              break;
+
+            case "engine_state":
+              setEngineState(msg.state);
+              break;
+
+            case "mic_level":
+              setMicLevel(msg.level);
+              break;
+
+            case "meter_level":
+              setMeterLevel(msg.level);
+              break;
+
+            case "stream_chunk":
+              setStreamingText(msg.full_text || "");
+              break;
+
+            case "transcription_finished":
+              setLastTranscription({
+                text: msg.text,
+                duration: msg.duration,
+                success: msg.success,
+              });
+              if (msg.stats) setStats(msg.stats);
+              if (msg.text) {
+                setHistory((prev) => [
+                  { ts: Date.now() / 1000, text: msg.text, seconds: msg.duration },
+                  ...prev,
+                ]);
+              }
+              break;
+
+            case "download_progress":
+              setDownloadProgress({
+                model: msg.model,
+                downloaded_bytes: msg.downloaded_bytes,
+                total_bytes: msg.total_bytes,
+                percent: msg.percent,
+                is_alive: msg.is_alive,
+                error: msg.error,
+                done: msg.done,
+              });
+              if (msg.done) {
+                setModels((prev) => ({
+                  ...prev,
+                  [msg.model]: {
+                    ...(prev[msg.model] || {}),
+                    downloaded: !msg.error,
+                  },
+                }));
+              }
+              break;
+
+            case "config_updated":
+              setConfig((prev) => ({ ...prev, [msg.key]: msg.value }));
+              break;
+
+            case "config_all_updated":
+              if (msg.config) setConfig(msg.config);
+              break;
+
+            case "history_cleared":
+              setHistory([]);
+              break;
+
+            case "enabled_state":
+              setEnabled(msg.enabled);
+              break;
+          }
+        } catch (e) {
+          console.error("Error parsing WebSocket message", e);
+        }
+      };
+    } catch (err) {
+      console.error("Failed to construct WebSocket client", err);
+    }
   }, [send]);
 
   useEffect(() => {
+    isUnmountedRef.current = false;
     connect();
     return () => {
-      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-      if (wsRef.current) wsRef.current.close();
+      isUnmountedRef.current = true;
+      if (reconnectTimeoutRef.current) {
+        window.clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
+      }
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
     };
   }, [connect]);
 
