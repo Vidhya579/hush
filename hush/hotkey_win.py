@@ -7,12 +7,14 @@ Two bindings, both runtime-configurable:
     modifiers are held. Non-modifier trigger keys are suppressed so they don't
     reach the focused app.
 
-Callbacks run on the hook thread — keep them tiny (the app relays via Qt signals).
+Callbacks are offloaded to an asynchronous queue worker to prevent blocking
+the OS low-level hook thread, avoiding silent hook eviction by Windows LowLevelHooksTimeout.
 Injected events (our own SendInput) are ignored.
 """
 
 import ctypes
 import ctypes.wintypes as wt
+import queue
 import threading
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -28,10 +30,24 @@ VK = {
     "Shift": (0xA0, 0xA1),
     "Win": (0x5B, 0x5C),
     "Space": (0x20,),
-    "D": (0x44,),
-    "F9": (0x78,),
-    "F10": (0x79,),
+    "CapsLock": (0x14,),
+    "Tab": (0x09,),
+    "Enter": (0x0D,),
+    "Esc": (0x1B,),
 }
+
+# Add standard letters A-Z (0x41 - 0x5A)
+for c in range(ord("A"), ord("Z") + 1):
+    VK[chr(c)] = (c,)
+
+# Add digits 0-9 (0x30 - 0x39)
+for d in range(10):
+    VK[str(d)] = (0x30 + d,)
+
+# Add function keys F1-F12 (0x70 - 0x7B)
+for f in range(1, 13):
+    VK[f"F{f}"] = (0x70 + f - 1,)
+
 _MODIFIER_NAMES = ("Ctrl", "Alt", "Shift", "Win")
 
 
@@ -77,6 +93,25 @@ class HotkeyHook:
         self._hook = None
         self.accept_injected = False  # tests only: let SendInput events drive the hook
         self._proc = _HOOKPROC(self._callback)  # keep a reference alive
+        self._queue = queue.SimpleQueue()
+        self._worker_thread = threading.Thread(target=self._worker_loop, name="hotkey-worker", daemon=True)
+        self._worker_thread.start()
+
+    def _worker_loop(self):
+        """Worker thread executing hotkey callbacks off the OS hook thread to prevent unhook timeouts."""
+        while True:
+            action = self._queue.get()
+            if action is None:
+                break
+            try:
+                if action == "down":
+                    self.on_hold_down()
+                elif action == "up":
+                    self.on_hold_up()
+                elif action == "toggle":
+                    self.on_toggle()
+            except Exception:
+                pass
 
     def set_bindings(self, hold_chord: str, toggle_combo: str):
         with self._lock:
@@ -88,7 +123,20 @@ class HotkeyHook:
 
     # ---- state helpers (call with lock held) ----
     def _group_down(self, name):
-        return any(vk in self._down for vk in VK[name])
+        vks = VK.get(name, ())
+        return any(vk in self._down for vk in vks)
+
+    def _cleanup_stuck_keys(self):
+        """Re-verify physical key state with GetAsyncKeyState to prevent stuck keys after alt-tab / lock."""
+        stale = []
+        for vk in self._down:
+            try:
+                if not (user32.GetAsyncKeyState(vk) & 0x8000):
+                    stale.append(vk)
+            except Exception:
+                pass
+        for vk in stale:
+            self._down.discard(vk)
 
     def _hold_chord_down(self):
         if not all(self._group_down(m) for m in self._hold_mods):
@@ -114,6 +162,7 @@ class HotkeyHook:
                         self._down.add(kb.vkCode)
                     else:
                         self._down.discard(kb.vkCode)
+                        self._cleanup_stuck_keys()
 
                     # toggle combo
                     if (is_down and self._tog_trigger and kb.vkCode in self._tog_trigger
@@ -137,12 +186,9 @@ class HotkeyHook:
                         if self._hold_trigger is not None and kb.vkCode in self._hold_trigger:
                             suppress = True
 
-                if fire == "down":
-                    self.on_hold_down()
-                elif fire == "up":
-                    self.on_hold_up()
-                elif fire == "toggle":
-                    self.on_toggle()
+                if fire:
+                    self._queue.put(fire)
+
                 if suppress:
                     return 1
         return user32.CallNextHookEx(None, n_code, w_param, l_param)
@@ -166,3 +212,5 @@ class HotkeyHook:
             self._hook = None
         if self._thread_id:
             user32.PostThreadMessageW(self._thread_id, 0x0012, 0, 0)  # WM_QUIT
+        if hasattr(self, "_queue"):
+            self._queue.put(None)

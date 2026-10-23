@@ -39,21 +39,42 @@ _PROTECT_RE = re.compile(
     rf"(?:\S+@\S+\.\S+|https?://\S+|www\.\S+|\w+(?:\.\w+)*\.(?:{'|'.join(_TLDS)})\b(?:/\S*)?)",
     re.IGNORECASE)
 
-_WORD_RE = re.compile(r"[A-Za-z][A-Za-z']*")
+# Unicode-aware word token matching across alphabets (Latin, Devanagari, accents, etc.)
+_WORD_RE = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)?", re.UNICODE)
 
 
 def _apply_dictionary(text: str, entries: list[str]) -> str:
-    """Replace words that fuzzy-match a dictionary entry with the entry's exact form."""
+    """Replace words and multi-word phrases that fuzzy-match a dictionary entry with the entry's exact form."""
     if not entries:
         return text
-    by_lower = {e.lower(): e for e in entries}
+
+    # Partition entries into multi-word phrases and single words
+    multi_word = []
+    single_word = {}
+    for e in entries:
+        e_clean = e.strip()
+        if not e_clean:
+            continue
+        if " " in e_clean:
+            multi_word.append(e_clean)
+        else:
+            single_word[e_clean.lower()] = e_clean
+
+    # Match multi-word phrases first (longest phrases first to prevent sub-string truncation)
+    multi_word.sort(key=lambda s: len(s.split()), reverse=True)
+    for phrase in multi_word:
+        pattern = re.compile(rf"(?<![\w]){re.escape(phrase)}(?![\w])", re.IGNORECASE | re.UNICODE)
+        text = pattern.sub(phrase, text)
+
+    if not single_word:
+        return text
 
     def fix(m: re.Match) -> str:
         w = m.group(0)
         lw = w.lower()
-        if lw in by_lower:
-            return by_lower[lw]  # exact word, canonical casing
-        for el, entry in by_lower.items():
+        if lw in single_word:
+            return single_word[lw]  # exact word, canonical casing
+        for el, entry in single_word.items():
             if len(lw) < 4 or abs(len(lw) - len(el)) > 3:
                 continue
             ratio = difflib.SequenceMatcher(None, lw, el).ratio()
@@ -67,10 +88,18 @@ def _apply_dictionary(text: str, entries: list[str]) -> str:
 
 
 def _repair(text: str) -> str:
+    # Protect intentional ellipses (...) and Unicode ellipsis (…) before punctuation collapse
+    text = re.sub(r"\.{3,}|…", "\x01ELLIPSIS\x01", text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" +([,.!?;:])", r"\1", text)          # no space before punctuation
-    text = re.sub(r"([,.!?;:])(?=[A-Za-z])", r"\1 ", text)  # one space after
-    text = re.sub(r"([,.!?;:]){2,}", r"\1", text)         # collapse doubled punctuation
+    # Insert space after punctuation when followed by Unicode word characters or quotes
+    text = re.sub(r"([,!?;:])(?=[^\W\d_]|[\"“'‘\(\[])", r"\1 ", text)
+    text = re.sub(r"(\.)(?=[^\W\d_]|[\"“'‘\(\[])", r"\1 ", text)
+    # Comma followed by a number with no space (e.g. "1, 2" instead of "1,2")
+    text = re.sub(r",(?=\d)", ", ", text)
+    text = re.sub(r"([,!?;:]){2,}", r"\1", text)         # collapse doubled non-period punctuation
+    text = re.sub(r"\.{2,}", ".", text)                  # collapse doubled periods (not ellipses)
+    text = text.replace("\x01ELLIPSIS\x01", "...")
     text = re.sub(r" *\n *", "\n", text)                  # trim around newlines
     return text.strip()
 
