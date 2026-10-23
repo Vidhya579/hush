@@ -72,7 +72,7 @@ export function useHush() {
   const retryCountRef = useRef<number>(0);
   const isUnmountedRef = useRef<boolean>(false);
 
-  // Play chimes via Web Audio / HTML5 Audio
+  // Play chimes via Web Audio / HTML5 Audio (used as offline fallback)
   const playLocalSound = useCallback((which: "start" | "stop") => {
     try {
       const audio = new Audio(`./sounds/${which}.wav`);
@@ -268,29 +268,27 @@ export function useHush() {
     };
   }, [connect]);
 
-  // Actions
+  // Actions - backend is single source of truth for audio chimes when connected
   const startDictation = useCallback((mode: "hold" | "toggle" = "hold") => {
-    if (config.sounds) playLocalSound("start");
+    if (!connected && config.sounds) playLocalSound("start");
     send({ action: "start_dictation", mode });
-  }, [config.sounds, playLocalSound, send]);
+  }, [config.sounds, connected, playLocalSound, send]);
 
   const stopDictation = useCallback(() => {
-    if (config.sounds) playLocalSound("stop");
+    if (!connected && config.sounds) playLocalSound("stop");
     send({ action: "stop_dictation" });
-  }, [config.sounds, playLocalSound, send]);
+  }, [config.sounds, connected, playLocalSound, send]);
 
   const cancelDictation = useCallback(() => {
     send({ action: "cancel_dictation" });
   }, [send]);
 
   const toggleDictation = useCallback(() => {
-    if (recording) {
-      if (config.sounds) playLocalSound("stop");
-    } else {
-      if (config.sounds) playLocalSound("start");
+    if (!connected && config.sounds) {
+      playLocalSound(recording ? "stop" : "start");
     }
     send({ action: "toggle_dictation" });
-  }, [config.sounds, playLocalSound, recording, send]);
+  }, [config.sounds, connected, playLocalSound, recording, send]);
 
   const updateConfig = useCallback((key: keyof HushConfig, value: any) => {
     setConfig((prev) => ({ ...prev, [key]: value }));
@@ -327,9 +325,12 @@ export function useHush() {
   }, [send]);
 
   const playSound = useCallback((which: "start" | "stop") => {
-    playLocalSound(which);
-    send({ action: "play_sound", which });
-  }, [playLocalSound, send]);
+    if (connected) {
+      send({ action: "play_sound", which });
+    } else {
+      playLocalSound(which);
+    }
+  }, [connected, playLocalSound, send]);
 
   const toggleHandsFreeMode = useCallback(() => {
     const nextVal = !config.hands_free_mode;
