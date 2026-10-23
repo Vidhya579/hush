@@ -132,6 +132,14 @@ class HushService:
         payload.update(kwargs)
         self.broadcast(payload)
 
+    def _schedule_auto_clear(self, expected_state: str, delay_s: float = 2.0):
+        """Schedule automatic return to 'idle' state unless new dictation begins."""
+        def _worker():
+            time.sleep(delay_s)
+            if self._state == expected_state and not self.recording and not self.busy:
+                self._set_state("idle", "")
+        threading.Thread(target=_worker, name="auto-clear-state", daemon=True).start()
+
     def _on_engine_state(self, state: str):
         self.broadcast({
             "type": "engine_state",
@@ -184,11 +192,7 @@ class HushService:
         if not opened:
             log.error("All mic begin attempts failed: %s", last_err)
             self._set_state("error", "Microphone unavailable")
-            def _auto_clear():
-                time.sleep(2.5)
-                if self._state == "error":
-                    self._set_state("idle", "")
-            threading.Thread(target=_auto_clear, daemon=True).start()
+            self._schedule_auto_clear("error", 2.5)
             return
 
         if self.cfg.get("hands_free_mode") and mode == "hold":
@@ -326,6 +330,7 @@ class HushService:
                 self._set_state("error", "No mic signal — check mic mute")
             else:
                 self._set_state("error", "No speech detected")
+            self._schedule_auto_clear("error", 2.5)
         else:
             if not ok:
                 if inject.foreground_injection_blocked():
@@ -334,8 +339,10 @@ class HushService:
                     msg = "Couldn't type — copied to clipboard"
                 self._set_state("error", msg)
                 inject._set_clipboard_text(text)
+                self._schedule_auto_clear("error", 3.0)
             else:
                 self._set_state("inserted", "✓ Inserted")
+                self._schedule_auto_clear("inserted", 2.0)
 
             if self.cfg.get("history_enabled"):
                 history.append(text, duration)
