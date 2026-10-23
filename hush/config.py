@@ -5,9 +5,13 @@ $XDG_DATA_HOME/hush (default ~/.local/share/hush) elsewhere.
 """
 
 import json
+import logging
 import os
 import sys
 import threading
+import time
+
+log = logging.getLogger("hush.config")
 
 
 def _app_dir():
@@ -64,10 +68,11 @@ DEFAULTS = {
 
 
 class Config:
-    """Thread-safe config backed by config.json."""
+    """Thread-safe config backed by config.json with Windows file-lock resilience."""
 
     def __init__(self):
         self._lock = threading.Lock()
+        os.makedirs(APP_DIR, exist_ok=True)
         os.makedirs(MODELS_DIR, exist_ok=True)
         self._data = dict(DEFAULTS)
         stored = {}
@@ -79,20 +84,12 @@ class Config:
                     self._data[k] = v
         except (OSError, ValueError):
             pass
-        # One-time migrations, each gated on the version that introduced it. Do NOT
-        # widen these to "< CONFIG_VERSION": that would re-run every past migration
-        # on every future bump and clobber deliberate choices (the v2 one resets the
-        # model, so a v3 bump would silently drag a large-v3-turbo user back to small).
+
         ver = stored.get("config_version", 1) if stored else CONFIG_VERSION
         if ver < 2:
-            # switch older English-only installs to the multilingual default so
-            # Hindi/Hinglish works without any setup.
             self._data["model"] = "small (multilingual)"
             self._data["language"] = "auto"
         if ver < 3:
-            # "CPU" used to be the only sensible default; it is now a pessimisation
-            # for the big model (see engine.resolve_compute_device). Only move
-            # installs still sitting on that old default -- a deliberate "GPU" stays.
             if self._data.get("compute_device") == "CPU":
                 self._data["compute_device"] = "Auto"
         self._data["config_version"] = CONFIG_VERSION
@@ -112,12 +109,37 @@ class Config:
             s = self._data["stats"]
             s["words"] += words
             s["utterances"] += 1
-            s["audio_seconds"] += audio_seconds
+            s["audio_seconds"] = round(s["audio_seconds"] + float(audio_seconds), 2)
         self.save()
 
     def save(self):
         with self._lock:
+            os.makedirs(APP_DIR, exist_ok=True)
             tmp = CONFIG_PATH + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self._data, f, indent=2)
-            os.replace(tmp, CONFIG_PATH)
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(self._data, f, indent=2)
+            except OSError as e:
+                log.error("Failed to write temporary config file %s: %s", tmp, e)
+                return
+
+            # On Windows, os.replace fails if another process (antivirus, indexer)
+            # has config.json open. Retry with exponential backoff before fallback.
+            replaced = False
+            for attempt in range(5):
+                try:
+                    os.replace(tmp, CONFIG_PATH)
+                    replaced = True
+                    break
+                except (PermissionError, OSError):
+                    time.sleep(0.02 * (2 ** attempt))
+
+            if not replaced:
+                # Fallback to direct overwrite if replace remains locked
+                try:
+                    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                        json.dump(self._data, f, indent=2)
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception as e:
+                    log.error("Config save fallback failed: %s", e)
