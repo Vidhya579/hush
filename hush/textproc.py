@@ -67,10 +67,18 @@ def _apply_dictionary(text: str, entries: list[str]) -> str:
 
 
 def _repair(text: str) -> str:
+    # Protect intentional ellipses (...) and Unicode ellipsis (…) before punctuation collapse
+    text = re.sub(r"\.{3,}|…", "\x01ELLIPSIS\x01", text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" +([,.!?;:])", r"\1", text)          # no space before punctuation
-    text = re.sub(r"([,.!?;:])(?=[A-Za-z])", r"\1 ", text)  # one space after
-    text = re.sub(r"([,.!?;:]){2,}", r"\1", text)         # collapse doubled punctuation
+    # Insert space after punctuation when followed by Unicode word characters or quotes
+    text = re.sub(r"([,!?;:])(?=[^\W\d_]|[\"“'‘\(\[])", r"\1 ", text)
+    text = re.sub(r"(\.)(?=[^\W\d_]|[\"“'‘\(\[])", r"\1 ", text)
+    # Comma followed by a number with no space (e.g. "1, 2" instead of "1,2")
+    text = re.sub(r",(?=\d)", ", ", text)
+    text = re.sub(r"([,!?;:]){2,}", r"\1", text)         # collapse doubled non-period punctuation
+    text = re.sub(r"\.{2,}", ".", text)                  # collapse doubled periods (not ellipses)
+    text = text.replace("\x01ELLIPSIS\x01", "...")
     text = re.sub(r" *\n *", "\n", text)                  # trim around newlines
     return text.strip()
 
