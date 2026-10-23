@@ -14,16 +14,52 @@ export function DictionaryTab({ dictionary, onUpdateDictionary }: DictionaryTabP
   const [newWord, setNewWord] = useState("");
 
   const handleAdd = () => {
-    const trimmed = newWord.trim();
-    if (!trimmed) return;
-    if (dictionary.includes(trimmed)) {
-      toast.error(`"${trimmed}" is already in your dictionary.`);
+    const raw = newWord.trim();
+    if (!raw) return;
+
+    // Split by comma, semicolon, or newline to support batch pasting
+    const candidates = raw
+      .split(/[,;\n]+/)
+      .map((w) => w.trim().replace(/^["'“‘]+|["'”’]+$/g, ""))
+      .filter((w) => w.length > 0);
+
+    if (candidates.length === 0) return;
+
+    const existingLower = new Set(dictionary.map((w) => w.toLowerCase()));
+    const toAdd: string[] = [];
+    const duplicates: string[] = [];
+
+    for (const cand of candidates) {
+      const lower = cand.toLowerCase();
+      if (existingLower.has(lower) || toAdd.some((a) => a.toLowerCase() === lower)) {
+        duplicates.push(cand);
+      } else {
+        toAdd.push(cand);
+      }
+    }
+
+    if (toAdd.length === 0) {
+      toast.error(
+        duplicates.length === 1
+          ? `"${duplicates[0]}" is already in your dictionary.`
+          : `All ${duplicates.length} terms are already in your dictionary.`
+      );
       return;
     }
-    const updated = [...dictionary, trimmed];
+
+    const updated = [...dictionary, ...toAdd];
     onUpdateDictionary(updated);
     setNewWord("");
-    toast.success(`Added "${trimmed}" to dictionary`);
+
+    if (toAdd.length === 1) {
+      toast.success(`Added "${toAdd[0]}" to dictionary`);
+    } else {
+      toast.success(`Added ${toAdd.length} terms to dictionary`);
+    }
+
+    if (duplicates.length > 0) {
+      toast.info(`Skipped ${duplicates.length} duplicate ${duplicates.length === 1 ? "term" : "terms"}`);
+    }
   };
 
   const handleRemove = (word: string) => {
@@ -57,7 +93,7 @@ export function DictionaryTab({ dictionary, onUpdateDictionary }: DictionaryTabP
                 handleAdd();
               }
             }}
-            placeholder="Add a name or term (e.g. Suryansh, Kubernetes, API)…"
+            placeholder="Add terms (e.g. Suryansh, Kubernetes, API - comma-separated)…"
             className="bg-neutral-950/80 border-white/10 rounded-full h-9 text-xs"
           />
           <Button
@@ -119,7 +155,7 @@ export function DictionaryTab({ dictionary, onUpdateDictionary }: DictionaryTabP
             1. <strong>Prompt bias:</strong> Whisper is seeded with your custom terms before speech begins, increasing the model's likelihood of recognizing rare proper nouns.
           </p>
           <p>
-            2. <strong>Fuzzy correction:</strong> If Whisper outputs a slight variation or typo of a known dictionary word, Hush automatically corrects it before typing.
+            2. <strong>Fuzzy post-correction:</strong> Phonetic slips or spelling mangles (e.g. "Siryanch" for "Suryansh") are automatically replaced with your canonical spelling.
           </p>
         </div>
       </Card>
