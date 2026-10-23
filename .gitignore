@@ -70,8 +70,6 @@ crash.dmp
 debug.txt
 
 # Generated test artifacts & audio dumps
-test/
-tests/
 temp_audio/
 recordings/
 *.tmp
@@ -90,4 +88,3 @@ desktop.ini
 .DS_Store
 $RECYCLE.BIN/
 *.lnk
-
