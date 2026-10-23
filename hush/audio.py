@@ -159,16 +159,23 @@ class Recorder:
             return self._stream is not None and self._stream.active
 
     def _callback(self, indata, frames, time_info, status):
+        """High-priority PortAudio callback. Guarded against unhandled exceptions to prevent CallbackAbort."""
         if not self._capturing:
             return
-        data = indata[:, 0].copy()
-        with self._lock:
-            if self._capturing:
-                self._chunks.append(data)
-                self._samples += len(data)
-        if self.on_level:
-            rms = float(np.sqrt(np.mean(data**2)))
-            self.on_level(min(1.0, rms * 18.0))
+        try:
+            data = indata[:, 0].copy()
+            with self._lock:
+                if self._capturing:
+                    self._chunks.append(data)
+                    self._samples += len(data)
+            if self.on_level and len(data) > 0:
+                rms = float(np.sqrt(np.mean(data**2)))
+                try:
+                    self.on_level(min(1.0, rms * 18.0))
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def begin(self, device=None):
         """Start keeping audio. Opens the stream first if needed with stream lock."""
@@ -185,10 +192,32 @@ class Recorder:
             return self._samples
 
     def read_range(self, start, end):
-        """Samples [start:end) as one array (for incremental transcription)."""
+        """Samples [start:end) as one array without re-concatenating full historical recording buffer."""
         with self._lock:
-            joined = np.concatenate(self._chunks) if self._chunks else np.empty(0, np.float32)
-        return joined[start:end]
+            if not self._chunks or start >= end or start >= self._samples:
+                return np.empty(0, np.float32)
+
+            needed_chunks = []
+            curr = 0
+            first_chunk_start = 0
+            for chunk in self._chunks:
+                chunk_len = len(chunk)
+                chunk_end = curr + chunk_len
+                if chunk_end > start and curr < end:
+                    if not needed_chunks:
+                        first_chunk_start = curr
+                    needed_chunks.append(chunk)
+                elif curr >= end:
+                    break
+                curr = chunk_end
+
+            if not needed_chunks:
+                return np.empty(0, np.float32)
+
+            first_offset = max(0, start - first_chunk_start)
+            joined = np.concatenate(needed_chunks)
+            slice_len = end - start
+            return joined[first_offset:first_offset + slice_len]
 
     def end(self):
         """Stop keeping audio; returns everything captured. Stream stays warm."""
